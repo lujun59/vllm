@@ -513,6 +513,12 @@ pub struct BenchServeArgs {
     #[arg(long)]
     pub sharegpt_output_len: Option<usize>,
 
+    /// System prompt to prepend to every chat request as a `system` role
+    /// message. Applies to chat backends (openai-chat). Overrides any
+    /// system message parsed from the dataset.
+    #[arg(long)]
+    pub system_prompt: Option<String>,
+
     /// Do not oversample if dataset is smaller than num_prompts.
     #[arg(long, default_value_t = false)]
     pub no_oversample: bool,

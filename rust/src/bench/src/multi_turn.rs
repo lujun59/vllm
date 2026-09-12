@@ -194,6 +194,11 @@ pub async fn run_multi_turn_benchmark(config: &BenchConfig) -> Result<serde_json
 
     let no_history = config.multi_turn_prefix_global_ratio > 0.0
         || config.multi_turn_prefix_conversation_ratio > 0.0;
+    prepare_conversation_system_prompts(
+        &mut conversations,
+        config.system_prompt.as_deref(),
+        tokenizer.as_ref(),
+    )?;
 
     if let Some(max_model_len) = config.max_model_len {
         let (filtered_conversations, filtered_turns) =
@@ -257,11 +262,12 @@ pub async fn run_multi_turn_benchmark(config: &BenchConfig) -> Result<serde_json
 
     // Ready check with a simple single request
     if config.ready_check_timeout_sec > 0 {
-        let first_turn = &conversations[0].turns[0];
+        let first_conversation = &conversations[0];
+        let first_turn = &first_conversation.turns[0];
         let test_input = RequestFuncInput {
             prompt: first_turn.user_message.clone(),
             api_url: config.api_url.clone(),
-            prompt_len: first_turn.user_message_len,
+            prompt_len: first_turn.user_message_len + first_conversation.system_prompt_len,
             output_len: first_turn.expected_output_len,
             model: model_id.clone(),
             model_name: model_name.clone(),
@@ -270,6 +276,7 @@ pub async fn run_multi_turn_benchmark(config: &BenchConfig) -> Result<serde_json
             extra_body: config.extra_body.clone(),
             ignore_eos: config.ignore_eos,
             request_id: None,
+            system_prompt: first_conversation.system_prompt.clone(),
             ..Default::default()
         };
 
@@ -542,6 +549,39 @@ pub async fn run_multi_turn_benchmark(config: &BenchConfig) -> Result<serde_json
     Ok(result_json)
 }
 
+fn prepare_conversation_system_prompts(
+    conversations: &mut [MultiTurnConversation],
+    system_prompt: Option<&str>,
+    tokenizer: Option<&crate::tokenizer::TokenizerKind>,
+) -> Result<()> {
+    let global_system: Option<Arc<str>> = system_prompt.map(Arc::from);
+    let mut token_counts = HashMap::new();
+    for conversation in conversations {
+        let Some(system) = global_system.as_ref().or(conversation.system_prompt.as_ref()).cloned()
+        else {
+            continue;
+        };
+        let tokens = match token_counts.get(&system) {
+            Some(&tokens) => tokens,
+            None => {
+                let tokens = tokenizer
+                    .ok_or_else(|| {
+                        BenchError::Config(
+                            "System prompt token counting requires a tokenizer".into(),
+                        )
+                    })?
+                    .encode(&system, false)?
+                    .len();
+                token_counts.insert(system.clone(), tokens);
+                tokens
+            }
+        };
+        conversation.system_prompt = Some(system);
+        conversation.system_prompt_len = tokens;
+    }
+    Ok(())
+}
+
 fn filter_turns_by_max_model_len(
     conversations: &mut Vec<MultiTurnConversation>,
     max_model_len: usize,
@@ -551,6 +591,7 @@ fn filter_turns_by_max_model_len(
     let before_turns: usize = conversations.iter().map(|c| c.turns.len()).sum();
 
     for conversation in conversations.iter_mut() {
+        let max_model_len = max_model_len.saturating_sub(conversation.system_prompt_len);
         if no_history {
             conversation.turns.retain(|turn| {
                 turn.user_message_len.saturating_add(turn.expected_output_len) <= max_model_len
@@ -618,8 +659,10 @@ async fn run_conversation(
     semaphore: &Semaphore,
 ) -> ConversationOutput {
     let conv_start = Instant::now();
+    let system_prompt = &conversation.system_prompt;
+    let system_prompt_len = conversation.system_prompt_len;
     let mut messages: Vec<serde_json::Value> = Vec::new();
-    let mut cumulative_tokens: usize = 0;
+    let mut cumulative_tokens: usize = system_prompt_len;
     let mut turn_outputs: Vec<TurnOutput> = Vec::new();
     let mut all_success = true;
 
@@ -638,7 +681,7 @@ async fn run_conversation(
                 "role": "user",
                 "content": [{"type": "text", "text": &*turn.user_message}]
             }));
-            cumulative_tokens = turn.user_message_len;
+            cumulative_tokens = system_prompt_len + turn.user_message_len;
         } else {
             // Normal mode: accumulate history
             messages.push(serde_json::json!({
@@ -684,6 +727,7 @@ async fn run_conversation(
             ignore_eos,
             request_id: Some(format!("{}-turn{}", conversation.conversation_id, turn_idx)),
             messages: Some(serde_json::json!(messages)),
+            system_prompt: system_prompt.clone(),
             ..Default::default()
         };
 
@@ -763,12 +807,17 @@ async fn run_conversation(
 mod tests {
     use std::sync::Arc;
 
-    use super::{filter_turns_by_max_model_len, valid_prefix_len_for_max_model_len};
+    use super::{
+        filter_turns_by_max_model_len, prepare_conversation_system_prompts,
+        valid_prefix_len_for_max_model_len,
+    };
     use crate::datasets::{ConversationTurn, MultiTurnConversation};
 
     fn conversation(turns: &[(usize, usize)]) -> MultiTurnConversation {
         MultiTurnConversation {
             conversation_id: "conv-0".to_string(),
+            system_prompt: None,
+            system_prompt_len: 0,
             turns: turns
                 .iter()
                 .map(|(user_message_len, expected_output_len)| ConversationTurn {
@@ -815,5 +864,86 @@ mod tests {
         assert_eq!(filtered_turns, 1);
         assert_eq!(conversations.len(), 1);
         assert_eq!(conversations[0].turns.len(), 2);
+    }
+
+    #[test]
+    fn test_system_prompt_reserves_context_in_both_history_modes() {
+        for no_history in [false, true] {
+            let mut conversations = vec![conversation(&[(40, 10), (45, 10)])];
+            conversations[0].system_prompt_len = 10;
+            let max_model_len = if no_history { 65 } else { 115 };
+            assert_eq!(
+                filter_turns_by_max_model_len(&mut conversations, max_model_len, no_history),
+                (0, 0)
+            );
+            assert_eq!(
+                filter_turns_by_max_model_len(&mut conversations, max_model_len - 1, no_history,).0,
+                1
+            );
+            assert!(conversations.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_sharegpt_system_preservation_and_global_override() {
+        let tokenizer = crate::tokenizer::TokenizerKind::Tiktoken(
+            crate::tiktoken::load_builtin_tiktoken("gpt2").unwrap(),
+        );
+        let path =
+            std::env::temp_dir().join(format!("vllm-bench-system-{}.json", uuid::Uuid::new_v4()));
+        let entries = serde_json::json!([{"conversations": [
+            {"from": "system", "value": "dataset instructions"},
+            {"from": "system", "value": "additional instructions"},
+            {"from": "human", "value": "question one"},
+            {"from": "gpt", "value": "answer one"},
+            {"from": "human", "value": "question two"},
+            {"from": "gpt", "value": "answer two"}
+        ]}]);
+        std::fs::write(&path, entries.to_string()).unwrap();
+        let loaded = crate::datasets::multi_turn::load_sharegpt_multi_turn(
+            &tokenizer,
+            path.to_str().unwrap(),
+            2,
+            Some(10),
+            None,
+            0,
+            "test-",
+        );
+        std::fs::remove_file(&path).unwrap();
+        let loaded = loaded.unwrap();
+        for global in [None, Some("global instructions"), Some("")] {
+            let mut conversations = loaded.clone();
+            conversations.push(conversation(&[(40, 10), (45, 10)]));
+            prepare_conversation_system_prompts(&mut conversations, global, Some(&tokenizer))
+                .unwrap();
+            let expected = global.unwrap_or("dataset instructions\nadditional instructions");
+            for loaded_conversation in &conversations[..2] {
+                assert_eq!(loaded_conversation.system_prompt.as_deref(), Some(expected));
+                assert_eq!(
+                    loaded_conversation.system_prompt_len,
+                    tokenizer.encode(expected, false).unwrap().len()
+                );
+                assert_eq!(loaded_conversation.turns.len(), 2);
+            }
+            assert_eq!(conversations[2].system_prompt.as_deref(), global);
+        }
+    }
+
+    #[test]
+    fn test_filter_uses_each_conversations_system_length() {
+        for no_history in [false, true] {
+            let mut conversations = vec![
+                conversation(&[(40, 10), (45, 10)]),
+                conversation(&[(40, 10), (45, 10)]),
+            ];
+            conversations[0].system_prompt_len = 10;
+            conversations[1].system_prompt_len = 11;
+            let max_model_len = if no_history { 65 } else { 115 };
+            assert_eq!(
+                filter_turns_by_max_model_len(&mut conversations, max_model_len, no_history),
+                (1, 2)
+            );
+            assert_eq!(conversations[0].system_prompt_len, 10);
+        }
     }
 }

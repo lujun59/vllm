@@ -613,6 +613,14 @@ pub async fn run_benchmark(config: &BenchConfig) -> Result<serde_json::Value> {
         "generated benchmark dataset"
     );
 
+    if config.backend == BackendKind::OpenaiChat {
+        prepare_system_prompts(
+            &mut input_requests,
+            config.system_prompt.as_deref(),
+            tokenizer.as_ref(),
+        )?;
+    }
+
     let filtered_count =
         filter_requests_by_max_model_len(&mut input_requests, config.max_model_len);
     if filtered_count > 0 {
@@ -666,6 +674,7 @@ pub async fn run_benchmark(config: &BenchConfig) -> Result<serde_json::Value> {
         multi_modal_content: first.multi_modal_content.clone(),
         chat_messages_json: first.chat_messages_json.clone(),
         prompt_list: first.prompt_list.clone(),
+        system_prompt: first.system_prompt.clone(),
     };
 
     // Ready check
@@ -715,12 +724,17 @@ pub async fn run_benchmark(config: &BenchConfig) -> Result<serde_json::Value> {
         } else {
             let num_special =
                 tokenizer.as_ref().map(|t| t.num_special_tokens_to_add()).unwrap_or(0);
+            let system_prompt_len = match (tokenizer.as_ref(), first.system_prompt.as_deref()) {
+                (Some(tokenizer), Some(system)) => tokenizer.encode(system, false)?.len(),
+                _ => 0,
+            };
             match sample_verify_prompts(
                 &client,
                 &config.base_url,
                 &model_id,
                 &input_requests,
                 num_special,
+                system_prompt_len,
                 &config.extra_headers,
             )
             .await?
@@ -743,6 +757,7 @@ pub async fn run_benchmark(config: &BenchConfig) -> Result<serde_json::Value> {
                         &model_id,
                         &mut input_requests,
                         num_special,
+                        system_prompt_len,
                         &config.extra_headers,
                     )
                     .await
@@ -893,7 +908,6 @@ pub async fn run_benchmark(config: &BenchConfig) -> Result<serde_json::Value> {
     let shared_backend = get_backend(config.backend)?;
     let shared_logprobs = config.logprobs;
     let shared_ignore_eos = config.ignore_eos;
-
     // Spawn all request tasks. Store prompt_len alongside handle so
     // we can preserve it in the panic recovery path.
     let mut handles: Vec<(usize, tokio::task::JoinHandle<RequestFuncOutput>)> =
@@ -923,6 +937,7 @@ pub async fn run_benchmark(config: &BenchConfig) -> Result<serde_json::Value> {
         let multi_modal_content = request.multi_modal_content.clone();
         let chat_messages_json = request.chat_messages_json.clone();
         let prompt_list = request.prompt_list.clone();
+        let system_prompt = request.system_prompt.clone();
 
         let delay_dur = std::time::Duration::from_secs_f64(*delay);
         let bench_start = benchmark_start;
@@ -966,6 +981,7 @@ pub async fn run_benchmark(config: &BenchConfig) -> Result<serde_json::Value> {
                     multi_modal_content,
                     chat_messages_json,
                     prompt_list,
+                    system_prompt,
                 };
 
                 // Send request, retry on connection errors
@@ -1162,6 +1178,69 @@ pub async fn run_benchmark(config: &BenchConfig) -> Result<serde_json::Value> {
     Ok(result_json)
 }
 
+fn prepare_system_prompts(
+    requests: &mut [crate::datasets::SampleRequest],
+    system_prompt: Option<&str>,
+    tokenizer: Option<&crate::tokenizer::TokenizerKind>,
+) -> Result<()> {
+    let mut token_counts = HashMap::new();
+    let global_system: Option<Arc<str>> = system_prompt.map(Arc::from);
+    for request in requests {
+        let Some(system) = global_system.as_ref().or(request.system_prompt.as_ref()).cloned()
+        else {
+            continue;
+        };
+        let tokenizer = tokenizer.ok_or_else(|| {
+            BenchError::Config("System prompt token counting requires a tokenizer".into())
+        })?;
+        if let Some(messages_json) = request.chat_messages_json.as_ref() {
+            let mut messages: Vec<serde_json::Value> = serde_json::from_str(messages_json)?;
+            let old_tokens = tokenizer.encode(&chat_prompt_text(&messages), false)?.len();
+            crate::backends::openai_chat::apply_system_prompt(&mut messages, &system);
+            let new_tokens = tokenizer.encode(&chat_prompt_text(&messages), false)?.len();
+            request.prompt_len = if new_tokens >= old_tokens {
+                request.prompt_len + (new_tokens - old_tokens)
+            } else {
+                request.prompt_len.saturating_sub(old_tokens - new_tokens)
+            };
+            request.chat_messages_json = Some(Arc::from(serde_json::to_string(&messages)?));
+            request.system_prompt = None;
+        } else {
+            let system_tokens = match token_counts.get(&system) {
+                Some(&tokens) => tokens,
+                None => {
+                    let tokens = tokenizer.encode(&system, false)?.len();
+                    token_counts.insert(system.clone(), tokens);
+                    tokens
+                }
+            };
+            request.prompt_len += system_tokens;
+            request.system_prompt = Some(system);
+        }
+    }
+    Ok(())
+}
+
+fn chat_prompt_text(messages: &[serde_json::Value]) -> String {
+    let mut parts = Vec::new();
+    for message in messages {
+        match &message["content"] {
+            serde_json::Value::String(text) => parts.push(text.as_str()),
+            serde_json::Value::Array(content) => {
+                for part in content {
+                    if part["type"] == "text"
+                        && let Some(text) = part["text"].as_str()
+                    {
+                        parts.push(text);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    parts.join("\n")
+}
+
 fn filter_requests_by_max_model_len(
     requests: &mut Vec<crate::datasets::SampleRequest>,
     max_model_len: Option<usize>,
@@ -1181,8 +1260,9 @@ fn filter_requests_by_max_model_len(
 mod max_model_len_tests {
     use std::sync::Arc;
 
-    use super::filter_requests_by_max_model_len;
+    use super::{chat_prompt_text, filter_requests_by_max_model_len, prepare_system_prompts};
     use crate::datasets::SampleRequest;
+    use crate::tokenizer::TokenizerKind;
 
     fn sample(prompt_len: usize, expected_output_len: usize) -> SampleRequest {
         SampleRequest {
@@ -1214,6 +1294,80 @@ mod max_model_len_tests {
 
         assert_eq!(filtered, 0);
         assert_eq!(requests.len(), 2);
+    }
+
+    #[test]
+    fn test_system_prompt_tokens_are_counted_before_filtering() {
+        let tokenizer =
+            TokenizerKind::Tiktoken(crate::tiktoken::load_builtin_tiktoken("gpt2").unwrap());
+        for global in [None, Some("global system prompt")] {
+            let mut request = sample(80, 20);
+            request.system_prompt = Some(Arc::from("dataset system"));
+            let mut requests = vec![request];
+            prepare_system_prompts(&mut requests, global, Some(&tokenizer)).unwrap();
+            let expected_system = global.unwrap_or("dataset system");
+            assert_eq!(requests[0].system_prompt.as_deref(), Some(expected_system));
+            assert_eq!(
+                requests[0].prompt_len,
+                80 + tokenizer.encode(expected_system, false).unwrap().len()
+            );
+            assert_eq!(
+                filter_requests_by_max_model_len(&mut requests, Some(100)),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn test_prebuilt_system_override_preserves_multimodal_token_count() {
+        let tokenizer =
+            TokenizerKind::Tiktoken(crate::tiktoken::load_builtin_tiktoken("gpt2").unwrap());
+        for system in [
+            "short",
+            "a much longer replacement system message with extra instructions",
+        ] {
+            let messages = serde_json::json!([
+                {"role": "system", "content": "old instructions"},
+                {"role": "user", "content": [
+                    {"type": "text", "text": "describe this"},
+                    {"type": "image_url", "image_url": {"url": "image.jpg"}}
+                ]}
+            ]);
+            let image_tokens = 256;
+            let text_tokens = tokenizer
+                .encode(&chat_prompt_text(messages.as_array().unwrap()), false)
+                .unwrap()
+                .len();
+            let mut request = sample(text_tokens + image_tokens, 20);
+            request.chat_messages_json = Some(Arc::from(messages.to_string()));
+            let mut requests = vec![request];
+            prepare_system_prompts(&mut requests, Some(system), Some(&tokenizer)).unwrap();
+            let actual: serde_json::Value =
+                serde_json::from_str(requests[0].chat_messages_json.as_deref().unwrap()).unwrap();
+            assert_eq!(
+                actual[0],
+                serde_json::json!({"role": "system", "content": system})
+            );
+            assert_eq!(actual[1], messages[1]);
+            assert_eq!(
+                requests[0].prompt_len,
+                image_tokens
+                    + tokenizer.encode(&format!("{system}\ndescribe this"), false).unwrap().len()
+            );
+            assert!(requests[0].system_prompt.is_none());
+        }
+    }
+
+    #[test]
+    fn test_no_system_override_leaves_prebuilt_request_unchanged() {
+        let messages =
+            r#"[{"role":"system","content":"original"},{"role":"user","content":"hello"}]"#;
+        let mut request = sample(80, 20);
+        request.chat_messages_json = Some(Arc::from(messages));
+        let mut requests = vec![request];
+        prepare_system_prompts(&mut requests, None, None).unwrap();
+        assert_eq!(requests[0].prompt_len, 80);
+        assert_eq!(requests[0].chat_messages_json.as_deref(), Some(messages));
     }
 }
 
@@ -1447,6 +1601,7 @@ async fn verify_and_fix_prompt_lengths(
     model: &str,
     requests: &mut [crate::datasets::SampleRequest],
     num_special: usize,
+    system_prompt_len: usize,
     extra_headers: &Option<std::collections::HashMap<String, String>>,
 ) -> Result<()> {
     let tokenize_url = Arc::new(format!("{base_url}/tokenize"));
@@ -1476,7 +1631,7 @@ async fn verify_and_fix_prompt_lengths(
         let detok_url = detokenize_url.clone();
         let model = model.to_string();
         let prompt = req.prompt.to_string(); // Convert Arc<str> to String for mutation
-        let expected_input_len = req.prompt_len + num_special;
+        let expected_input_len = req.prompt_len.saturating_sub(system_prompt_len) + num_special;
         let api_key = api_key.clone();
         let headers = extra_headers.clone();
         let sem = sem.clone();
@@ -1827,6 +1982,7 @@ async fn sample_verify_prompts(
     model: &str,
     requests: &[crate::datasets::SampleRequest],
     num_special: usize,
+    system_prompt_len: usize,
     extra_headers: &Option<std::collections::HashMap<String, String>>,
 ) -> Result<SampleVerifyOutcome> {
     let sample_size = 10.min(requests.len());
@@ -1854,7 +2010,7 @@ async fn sample_verify_prompts(
             Err(e) => return Err(e),
         };
 
-        let expected = request.prompt_len + num_special;
+        let expected = request.prompt_len.saturating_sub(system_prompt_len) + num_special;
         if tokens.len() != expected {
             tracing::warn!(
                 prompt_index = i,

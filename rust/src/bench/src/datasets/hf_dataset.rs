@@ -683,6 +683,28 @@ fn extract_chat_completion(messages: &[serde_json::Value]) -> Option<String> {
     None
 }
 
+/// Extract the first system message from a chat message array.
+fn extract_chat_system(messages: &[serde_json::Value]) -> Option<String> {
+    for msg in messages {
+        let role = msg
+            .get("role")
+            .and_then(|r| r.as_str())
+            .or_else(|| msg.get("from").and_then(|f| f.as_str()));
+        let content = msg
+            .get("content")
+            .and_then(|c| c.as_str())
+            .or_else(|| msg.get("value").and_then(|v| v.as_str()));
+
+        if let (Some(role), Some(content)) = (role, content)
+            && role == "system"
+            && !content.is_empty()
+        {
+            return Some(content.to_string());
+        }
+    }
+    None
+}
+
 /// Convert downloaded HF dataset rows to SampleRequests.
 pub fn load_hf_dataset(
     tokenizer: &TokenizerKind,
@@ -749,6 +771,9 @@ pub fn load_hf_dataset(
 
         let row = &entries[entry_idx];
 
+        // Optional system prompt (chat format only).
+        let mut system: Option<String> = None;
+
         // Extract prompt and optional completion based on format
         let (prompt, completion) = match &format {
             ColumnFormat::Chat(col) => {
@@ -758,6 +783,7 @@ pub fn load_hf_dataset(
                     Some(p) => p,
                     None => continue,
                 };
+                system = extract_chat_system(&messages);
                 let completion = extract_chat_completion(&messages);
                 (prompt, completion)
             }
@@ -861,6 +887,7 @@ pub fn load_hf_dataset(
             prompt_len,
             expected_output_len: output_len,
             request_id: Some(format!("{request_id_prefix}{idx}")),
+            system_prompt: system.map(Arc::from),
             ..Default::default()
         });
         idx += 1;
@@ -1104,6 +1131,39 @@ mod tests {
     fn test_extract_chat_prompt_no_user() {
         let messages = vec![serde_json::json!({"role": "system", "content": "You are helpful"})];
         assert_eq!(extract_chat_prompt(&messages), None);
+    }
+
+    #[test]
+    fn test_extract_chat_system_role_content() {
+        let messages = vec![
+            serde_json::json!({"role": "system", "content": "You are helpful"}),
+            serde_json::json!({"role": "user", "content": "Hi"}),
+        ];
+        assert_eq!(
+            extract_chat_system(&messages),
+            Some("You are helpful".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_chat_system_none() {
+        let messages = vec![
+            serde_json::json!({"role": "user", "content": "Hi"}),
+            serde_json::json!({"role": "assistant", "content": "Hello"}),
+        ];
+        assert_eq!(extract_chat_system(&messages), None);
+    }
+
+    #[test]
+    fn test_extract_chat_system_from_value() {
+        let messages = vec![
+            serde_json::json!({"from": "system", "value": "Be concise"}),
+            serde_json::json!({"from": "human", "value": "Hi"}),
+        ];
+        assert_eq!(
+            extract_chat_system(&messages),
+            Some("Be concise".to_string())
+        );
     }
 
     #[test]

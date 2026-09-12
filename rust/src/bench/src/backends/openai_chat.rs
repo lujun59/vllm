@@ -167,7 +167,7 @@ impl OpenAIChatBackend {
 fn build_text_payload(input: &RequestFuncInput) -> serde_json::Value {
     let model = input.model_name.as_deref().unwrap_or(&input.model);
 
-    let messages = if let Some(ref msgs) = input.messages {
+    let mut messages = if let Some(ref msgs) = input.messages {
         msgs.clone()
     } else {
         let content = serde_json::json!([
@@ -175,6 +175,9 @@ fn build_text_payload(input: &RequestFuncInput) -> serde_json::Value {
         ]);
         serde_json::json!([{"role": "user", "content": content}])
     };
+    if let Some(system_prompt) = input.system_prompt.as_deref() {
+        apply_system_prompt(messages.as_array_mut().unwrap(), system_prompt);
+    }
 
     let mut payload = serde_json::json!({
         "model": model,
@@ -228,12 +231,24 @@ fn build_mm_payload(input: &RequestFuncInput) -> Vec<u8> {
     if let Some(ref msgs) = input.chat_messages_json {
         // --enable-multimodal-chat: the dataset pre-built the full messages
         // array (text + mm parts); splice it verbatim.
-        json.push_str(msgs);
+        if let Some(system_prompt) = input.system_prompt.as_deref() {
+            json.push_str(&override_system_message(msgs, system_prompt));
+        } else {
+            json.push_str(msgs);
+        }
     } else {
         let mm = input.multi_modal_content.as_ref().unwrap();
 
-        // [{"role":"user","content":[ <text part>
-        json.push_str(r#"[{"role":"user","content":[{"type":"text","text":""#);
+        // Optional system message prefix
+        json.push('[');
+        if let Some(sys) = input.system_prompt.as_deref() {
+            json.push_str(r#"{"role":"system","content":""#);
+            push_json_escaped_str(&mut json, sys);
+            json.push_str(r#""},"#);
+        }
+
+        // {"role":"user","content":[ <text part>
+        json.push_str(r#"{"role":"user","content":[{"type":"text","text":""#);
         // JSON-escape the prompt text (handles \n, \t, unicode, quotes)
         push_json_escaped_str(&mut json, &input.prompt);
         json.push_str(r#""}"#);
@@ -278,7 +293,54 @@ fn build_mm_payload(input: &RequestFuncInput) -> Vec<u8> {
     }
 
     json.push('}');
+    if let Some(serde_json::Value::Object(extra)) = input.extra_body.as_ref()
+        && extra.keys().any(|key| {
+            matches!(
+                key.as_str(),
+                "model"
+                    | "messages"
+                    | "max_completion_tokens"
+                    | "stream"
+                    | "stream_options"
+                    | "ignore_eos"
+            )
+        })
+    {
+        let mut payload: std::collections::BTreeMap<String, Box<serde_json::value::RawValue>> =
+            serde_json::from_str(&json).unwrap();
+        for (key, value) in extra {
+            payload.insert(key.clone(), serde_json::value::to_raw_value(value).unwrap());
+        }
+        return serde_json::to_vec(&payload).unwrap();
+    }
     json.into_bytes()
+}
+
+pub(crate) fn apply_system_prompt(messages: &mut Vec<serde_json::Value>, system_prompt: &str) {
+    messages.retain(|message| message["role"] != "system");
+    messages.insert(
+        0,
+        serde_json::json!({"role": "system", "content": system_prompt}),
+    );
+}
+
+fn override_system_message(messages_json: &str, system_prompt: &str) -> String {
+    #[derive(serde::Deserialize)]
+    struct MessageRole<'a> {
+        role: &'a str,
+    }
+
+    let mut messages: Vec<&serde_json::value::RawValue> =
+        serde_json::from_str(messages_json).unwrap();
+    messages.retain(|message| {
+        serde_json::from_str::<MessageRole<'_>>(message.get()).unwrap().role != "system"
+    });
+    let system = serde_json::value::to_raw_value(
+        &serde_json::json!({"role": "system", "content": system_prompt}),
+    )
+    .unwrap();
+    messages.insert(0, &system);
+    serde_json::to_string(&messages).unwrap()
 }
 
 /// Write a JSON-escaped string (without surrounding quotes) into the buffer.
@@ -370,7 +432,116 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&build_mm_payload(&input)).unwrap();
         assert_eq!(v["ignore_eos"], true);
         assert_eq!(v["temperature"], 0.5);
-        // keys already set above must not be overridden by extra_body
-        assert_eq!(v["stream"], true);
+        assert_eq!(v["stream"], false);
+    }
+
+    #[test]
+    fn test_prebuilt_extra_body_matches_text_payload() {
+        let messages = serde_json::json!([
+            {"role": "user", "content": "question"},
+            {"role": "assistant", "content": "answer"},
+            {"role": "user", "content": "follow-up"}
+        ]);
+        for extra in [
+            serde_json::json!({"max_completion_tokens": 64}),
+            serde_json::json!({
+                "model": "override-model",
+                "messages": [{"role": "user", "content": "override"}],
+                "stream": false,
+                "stream_options": {"include_usage": false},
+                "ignore_eos": false,
+                "temperature": 0.5
+            }),
+        ] {
+            let input = RequestFuncInput {
+                model: "test-model".into(),
+                output_len: 128,
+                messages: Some(messages.clone()),
+                chat_messages_json: Some(Arc::from(messages.to_string())),
+                ignore_eos: true,
+                extra_body: Some(extra),
+                ..Default::default()
+            };
+            let raw: serde_json::Value = serde_json::from_slice(&build_mm_payload(&input)).unwrap();
+            assert_eq!(raw, build_text_payload(&input));
+        }
+    }
+
+    /// A system prompt must be prepended as a `system` message in the text path.
+    #[test]
+    fn test_build_text_payload_with_system_prompt() {
+        let input = RequestFuncInput {
+            prompt: Arc::from("Tell me a joke"),
+            model: "test-model".to_string(),
+            output_len: 32,
+            system_prompt: Some(Arc::from("You are helpful")),
+            ..Default::default()
+        };
+        let v = build_text_payload(&input);
+        assert_eq!(v["messages"][0]["role"], "system");
+        assert_eq!(v["messages"][0]["content"], "You are helpful");
+        assert_eq!(v["messages"][1]["role"], "user");
+        assert_eq!(v["messages"][1]["content"][0]["text"], "Tell me a joke");
+    }
+
+    /// Without a system prompt, only a single `user` message is emitted.
+    #[test]
+    fn test_build_text_payload_without_system_prompt() {
+        let input = RequestFuncInput {
+            prompt: Arc::from("Hi"),
+            model: "test-model".to_string(),
+            output_len: 32,
+            ..Default::default()
+        };
+        let v = build_text_payload(&input);
+        assert_eq!(v["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(v["messages"][0]["role"], "user");
+    }
+
+    /// A system prompt must be prepended in the multimodal raw-splice path too.
+    #[test]
+    fn test_build_mm_payload_with_system_prompt() {
+        let mut input = mm_input();
+        input.system_prompt = Some(Arc::from("Be concise"));
+        let v: serde_json::Value = serde_json::from_slice(&build_mm_payload(&input)).unwrap();
+        assert_eq!(v["messages"][0]["role"], "system");
+        assert_eq!(v["messages"][0]["content"], "Be concise");
+        assert_eq!(v["messages"][1]["role"], "user");
+        let content = v["messages"][1]["content"].as_array().unwrap();
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[1]["type"], "image_url");
+    }
+
+    #[test]
+    fn test_system_prompt_overrides_prebuilt_messages() {
+        for old_system in [None, Some("old system")] {
+            let mut messages = serde_json::json!([
+                {"role": "user", "content": [{"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,AAAA"}}]},
+                {"role": "assistant", "content": "previous answer"},
+                {"role": "user", "content": "next question"},
+            ]);
+            if let Some(system) = old_system {
+                messages
+                    .as_array_mut()
+                    .unwrap()
+                    .insert(0, serde_json::json!({"role": "system", "content": system}));
+            }
+            let input = RequestFuncInput {
+                messages: Some(messages.clone()),
+                chat_messages_json: Some(Arc::from(messages.to_string())),
+                system_prompt: Some(Arc::from("new \"system\"\nmessage")),
+                ..Default::default()
+            };
+            let text = build_text_payload(&input);
+            let raw: serde_json::Value = serde_json::from_slice(&build_mm_payload(&input)).unwrap();
+            let expected = serde_json::json!([
+                {"role": "system", "content": "new \"system\"\nmessage"},
+                {"role": "user", "content": [{"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,AAAA"}}]},
+                {"role": "assistant", "content": "previous answer"},
+                {"role": "user", "content": "next question"},
+            ]);
+            assert_eq!(text["messages"], expected);
+            assert_eq!(raw["messages"], expected);
+        }
     }
 }

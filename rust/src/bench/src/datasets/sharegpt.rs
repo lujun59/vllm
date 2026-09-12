@@ -11,10 +11,10 @@ use super::SampleRequest;
 use crate::error::{BenchError, Result};
 use crate::tokenizer::TokenizerKind;
 
-/// Default validation bounds matching Python's is_valid_sequence() defaults.
-const MIN_LEN: usize = 4;
-const MAX_PROMPT_LEN: usize = 1024;
-const MAX_TOTAL_LEN: usize = 2048;
+/// Validation bounds for full-history ShareGPT requests.
+const MIN_LEN: usize = 1;
+const MAX_PROMPT_LEN: usize = 128000;
+const MAX_TOTAL_LEN: usize = 150000;
 
 /// Default HuggingFace dataset repo and filename for ShareGPT.
 const DEFAULT_SHAREGPT_REPO: &str = "anon8231489123/ShareGPT_Vicuna_unfiltered";
@@ -101,35 +101,34 @@ pub fn load_sharegpt_dataset(
         }
 
         let conversations = entry["conversations"].as_array().unwrap();
-        let prompt = conversations[0]["value"].as_str().unwrap_or("");
-        let completion = conversations[1]["value"].as_str().unwrap_or("");
-
-        if prompt.is_empty() {
+        let Some((messages_json, prompt_text, completion)) = build_sharegpt_messages(conversations)
+        else {
             continue;
-        }
+        };
 
-        // Tokenize prompt and completion
-        let prompt_ids = tokenizer.encode(prompt, false)?;
+        // Tokenize the full conversation (all sent turns) and the completion.
+        let prompt_ids = tokenizer.encode(&prompt_text, false)?;
         let prompt_len = prompt_ids.len();
 
         let new_output_len = if let Some(override_len) = output_len_override {
             override_len
         } else {
-            let completion_ids = tokenizer.encode(completion, false)?;
+            let completion_ids = tokenizer.encode(&completion, false)?;
             completion_ids.len()
         };
 
-        // Validate sequence lengths (matching Python's is_valid_sequence)
+        // Validate sequence lengths.
         let skip_min_output = output_len_override.is_some();
         if !is_valid_sequence(prompt_len, new_output_len, skip_min_output) {
             continue;
         }
 
         samples.push(SampleRequest {
-            prompt: Arc::from(prompt),
+            prompt: Arc::from(prompt_text.as_str()),
             prompt_len,
             expected_output_len: new_output_len,
             request_id: Some(format!("{request_id_prefix}{ind}")),
+            chat_messages_json: Some(Arc::from(messages_json.as_str())),
             ..Default::default()
         });
         ind += 1;
@@ -172,8 +171,87 @@ pub fn load_sharegpt_dataset(
     Ok(samples)
 }
 
+/// Build the full multi-turn OpenAI `messages` array from a ShareGPT conversation,
+/// keeping every turn up to and including the **last** human/user turn.
+///
+/// Returns `(messages_json, prompt_text, completion)`:
+/// - `messages_json`: serialized `messages` array (an optional leading `system`
+///   turn plus all human/gpt turns through the final human turn), sent verbatim.
+/// - `prompt_text`: concatenation of all included turn contents, used only for
+///   token accounting (`prompt_len`).
+/// - `completion`: the assistant reply that follows the final human turn, if any;
+///   used only to estimate the output length and is not sent.
+///
+/// Returns `None` when the conversation has no human/user turn.
+///
+/// Role mapping: `system` -> `system`, `human`/`user` -> `user`,
+/// `gpt`/`assistant` -> `assistant`. Turns without a recognized `from` role are
+/// skipped. When no `from` roles are present at all, falls back to the original
+/// positional behavior (`[0]` = user prompt, `[1]` = assistant completion).
+fn build_sharegpt_messages(
+    conversations: &[serde_json::Value],
+) -> Option<(String, String, String)> {
+    fn role_of(m: &serde_json::Value) -> Option<&str> {
+        m.get("from").and_then(|f| f.as_str())
+    }
+    fn value_of(m: &serde_json::Value) -> &str {
+        m.get("value").and_then(|v| v.as_str()).unwrap_or("")
+    }
+
+    // Find the last human/user turn; everything up to it is sent as context.
+    let last_human = conversations
+        .iter()
+        .rposition(|m| matches!(role_of(m), Some("human") | Some("user")));
+
+    let Some(last_human) = last_human else {
+        // No `from` roles at all: fall back to positional single-turn behavior.
+        if conversations.iter().all(|m| role_of(m).is_none()) && conversations.len() >= 2 {
+            let prompt = value_of(&conversations[0]);
+            if prompt.is_empty() {
+                return None;
+            }
+            let completion = value_of(&conversations[1]);
+            let messages = serde_json::json!([{"role": "user", "content": prompt}]);
+            let messages_json = serde_json::to_string(&messages).ok()?;
+            return Some((messages_json, prompt.to_string(), completion.to_string()));
+        }
+        return None;
+    };
+
+    let mut messages = Vec::new();
+    let mut prompt_text = String::new();
+    for m in &conversations[..=last_human] {
+        let (api_role, content) = match role_of(m) {
+            Some("system") => ("system", value_of(m)),
+            Some("human") | Some("user") => ("user", value_of(m)),
+            Some("gpt") | Some("assistant") => ("assistant", value_of(m)),
+            _ => continue,
+        };
+        if !prompt_text.is_empty() {
+            prompt_text.push('\n');
+        }
+        prompt_text.push_str(content);
+        messages.push(serde_json::json!({"role": api_role, "content": content}));
+    }
+
+    if prompt_text.is_empty() {
+        return None;
+    }
+
+    // Assistant reply after the final human turn, used only for output-length
+    // estimation (not sent to the model).
+    let completion = conversations[last_human + 1..]
+        .iter()
+        .find(|m| matches!(role_of(m), Some("gpt") | Some("assistant")))
+        .map(value_of)
+        .unwrap_or("")
+        .to_string();
+
+    let messages_json = serde_json::to_string(&messages).ok()?;
+    Some((messages_json, prompt_text, completion))
+}
+
 /// Validate a sequence based on prompt and output lengths.
-/// Mirrors Python's is_valid_sequence() from datasets.py:260-284.
 fn is_valid_sequence(
     prompt_len: usize,
     output_len: usize,
@@ -203,14 +281,95 @@ mod tests {
         // Valid
         assert!(is_valid_sequence(100, 50, false));
         // Prompt too short
-        assert!(!is_valid_sequence(3, 50, false));
+        assert!(!is_valid_sequence(0, 50, false));
         // Output too short
-        assert!(!is_valid_sequence(100, 3, false));
+        assert!(!is_valid_sequence(100, 0, false));
         // Output too short but skip check
-        assert!(is_valid_sequence(100, 1, true));
+        assert!(is_valid_sequence(100, 0, true));
         // Prompt too long
-        assert!(!is_valid_sequence(1025, 50, false));
+        assert!(!is_valid_sequence(128001, 1, false));
         // Combined too long
-        assert!(!is_valid_sequence(1024, 1025, false));
+        assert!(!is_valid_sequence(128000, 22001, false));
+        assert!(is_valid_sequence(1, 1, false));
+        assert!(is_valid_sequence(128000, 22000, false));
+    }
+
+    #[test]
+    fn test_build_sharegpt_messages_with_system() {
+        let convs = vec![
+            serde_json::json!({"from": "system", "value": "You are helpful"}),
+            serde_json::json!({"from": "human", "value": "Hi"}),
+            serde_json::json!({"from": "gpt", "value": "Hello!"}),
+        ];
+        let (json, prompt, completion) = build_sharegpt_messages(&convs).unwrap();
+        let msgs: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(msgs[0]["role"], "system");
+        assert_eq!(msgs[0]["content"], "You are helpful");
+        assert_eq!(msgs[1]["role"], "user");
+        assert_eq!(msgs[1]["content"], "Hi");
+        // Only up to the last human is included; the trailing gpt is the completion.
+        assert_eq!(msgs.as_array().unwrap().len(), 2);
+        assert_eq!(completion, "Hello!");
+        assert!(prompt.contains("Hi"));
+    }
+
+    #[test]
+    fn test_build_sharegpt_messages_multi_turn_keeps_history() {
+        let convs = vec![
+            serde_json::json!({"from": "human", "value": "Q1"}),
+            serde_json::json!({"from": "gpt", "value": "A1"}),
+            serde_json::json!({"from": "human", "value": "Q2"}),
+            serde_json::json!({"from": "gpt", "value": "A2"}),
+        ];
+        let (json, _prompt, completion) = build_sharegpt_messages(&convs).unwrap();
+        let msgs: serde_json::Value = serde_json::from_str(&json).unwrap();
+        // Keep every turn through the last human (Q1, A1, Q2); A2 is the completion.
+        assert_eq!(msgs.as_array().unwrap().len(), 3);
+        assert_eq!(msgs[0]["role"], "user");
+        assert_eq!(msgs[0]["content"], "Q1");
+        assert_eq!(msgs[1]["role"], "assistant");
+        assert_eq!(msgs[1]["content"], "A1");
+        assert_eq!(msgs[2]["role"], "user");
+        assert_eq!(msgs[2]["content"], "Q2");
+        assert_eq!(completion, "A2");
+    }
+
+    #[test]
+    fn test_build_sharegpt_messages_trailing_human_no_completion() {
+        let convs = vec![
+            serde_json::json!({"from": "human", "value": "Q1"}),
+            serde_json::json!({"from": "gpt", "value": "A1"}),
+            serde_json::json!({"from": "human", "value": "Q2"}),
+        ];
+        let (json, _prompt, completion) = build_sharegpt_messages(&convs).unwrap();
+        let msgs: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(msgs.as_array().unwrap().len(), 3);
+        assert_eq!(msgs[2]["content"], "Q2");
+        // No assistant reply after the final human turn.
+        assert_eq!(completion, "");
+    }
+
+    #[test]
+    fn test_build_sharegpt_messages_positional_fallback() {
+        // No `from` roles — fall back to single-turn positional [0]/[1].
+        let convs = vec![
+            serde_json::json!({"value": "prompt text"}),
+            serde_json::json!({"value": "completion text"}),
+        ];
+        let (json, prompt, completion) = build_sharegpt_messages(&convs).unwrap();
+        let msgs: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(msgs.as_array().unwrap().len(), 1);
+        assert_eq!(msgs[0]["role"], "user");
+        assert_eq!(prompt, "prompt text");
+        assert_eq!(completion, "completion text");
+    }
+
+    #[test]
+    fn test_build_sharegpt_messages_no_human_returns_none() {
+        let convs = vec![
+            serde_json::json!({"from": "system", "value": "You are helpful"}),
+            serde_json::json!({"from": "gpt", "value": "Hello!"}),
+        ];
+        assert!(build_sharegpt_messages(&convs).is_none());
     }
 }

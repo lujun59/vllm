@@ -55,6 +55,11 @@ pub struct SampleRequest {
     /// rerank sends `[0]` as the query and `[1..]` as documents (random-rerank).
     /// Mirrors Python's list-valued `SampleRequest.prompt`.
     pub prompt_list: Option<Arc<[Arc<str>]>>,
+    /// Optional system prompt for chat requests. When set, the chat backend
+    /// prepends a `{"role":"system","content":...}` message. Parsed from the
+    /// dataset (ShareGPT/HF `system` messages) or supplied globally via
+    /// `--system-prompt`.
+    pub system_prompt: Option<Arc<str>>,
 }
 
 impl Default for SampleRequest {
@@ -70,6 +75,7 @@ impl Default for SampleRequest {
             multi_modal_content: None,
             chat_messages_json: None,
             prompt_list: None,
+            system_prompt: None,
         }
     }
 }
@@ -207,4 +213,6 @@ pub struct ConversationTurn {
 pub struct MultiTurnConversation {
     pub conversation_id: String,
     pub turns: Vec<ConversationTurn>,
+    pub system_prompt: Option<Arc<str>>,
+    pub system_prompt_len: usize,
 }

@@ -162,6 +162,8 @@ pub fn generate_multi_turn_random(
             Ok(MultiTurnConversation {
                 conversation_id: format!("{request_id_prefix}conv-{conv_idx}"),
                 turns,
+                system_prompt: None,
+                system_prompt_len: 0,
             })
         })
         .collect()
@@ -301,6 +303,8 @@ fn generate_prefix_sharing_conversations(
             Ok(MultiTurnConversation {
                 conversation_id: format!("{request_id_prefix}conv-{conv_idx}"),
                 turns,
+                system_prompt: None,
+                system_prompt_len: 0,
             })
         })
         .collect()
@@ -423,9 +427,17 @@ pub fn load_sharegpt_multi_turn(
 
         if turns.len() >= 2 {
             let conv_idx = conversations.len();
+            let system_messages: Vec<&str> = msgs
+                .iter()
+                .filter(|message| message["from"] == "system")
+                .filter_map(|message| message["value"].as_str())
+                .collect();
             conversations.push(MultiTurnConversation {
                 conversation_id: format!("{request_id_prefix}conv-{conv_idx}"),
                 turns,
+                system_prompt: (!system_messages.is_empty())
+                    .then(|| Arc::from(system_messages.join("\n"))),
+                system_prompt_len: 0,
             });
         }
     }
